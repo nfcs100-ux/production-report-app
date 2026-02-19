@@ -54,7 +54,7 @@ def normalize_station_for_calc(name):
 df["集計用ステーション"] = df["ステーション"].apply(normalize_station_for_calc)
 
 # =========================
-# フィルタUI（※統合しない）
+# フィルタUI
 # =========================
 st.subheader("検索・フィルタ")
 
@@ -69,7 +69,6 @@ with c2:
 
 with c3:
     stations = ["すべて"] + sorted(df["ステーション"].dropna().unique())
-    # ★変更点: selectbox を multiselect に変更
     selected_stations = st.multiselect("ステーション", stations, default=["すべて"])
 
 with c4:
@@ -98,5 +97,206 @@ if order_no:
 if selected_item != "すべて":
     filtered_df = filtered_df[filtered_df["受注品番"] == selected_item]
 
-# ★変更点: 複数選択に対応するため isin を使用
-if "
+if "すべて" not in selected_stations:
+    filtered_df = filtered_df[filtered_df["ステーション"].isin(selected_stations)]
+
+if "すべて" not in selected_workers:
+    filtered_df = filtered_df[filtered_df["作業者"].isin(selected_workers)]
+
+if len(date_range) == 2:
+    s, e = date_range
+    filtered_df = filtered_df[
+        (filtered_df["時刻"] >= pd.to_datetime(s)) &
+        (filtered_df["時刻"] <= pd.to_datetime(e) + pd.Timedelta(days=1))
+    ]
+
+# =========================
+# 製造数集計用データ
+# （仕上げのみ統合）
+# =========================
+finish_raw = filtered_df[
+    (filtered_df["集計用ステーション"] == "仕上げ") &
+    (filtered_df["操作"].isin(["完了", "中断"]))
+]
+
+finish_dedup = (
+    finish_raw
+    .groupby(
+        ["受注番号", "受注品番", "集計用ステーション", "操作", "時刻"],
+        as_index=False
+    )
+    .agg(
+        製造数=("製造数", "max"),
+        受注数=("受注数", "max")
+    )
+)
+
+# =========================
+# 受注単位 仕上げ完了率
+# =========================
+order_summary = (
+    finish_dedup
+    .groupby(["受注番号", "受注品番"], as_index=False)
+    .agg(
+        受注数=("受注数", "max"),
+        仕上げ製造数=("製造数", "sum")
+    )
+)
+
+if not order_summary.empty:
+    order_summary["仕上げ完了率(%)"] = (
+        order_summary["仕上げ製造数"] / order_summary["受注数"] * 100
+    ).round(1)
+
+# =====================================================
+# ★ 作業者別 日別 工程別 製造実績 ＋ 作業時間（差分方式）
+# =====================================================
+
+worker_base = filtered_df.copy()
+
+start_ops = ["開始", "再開"]
+end_ops = ["中断", "完了"]
+
+# -----------------------------------------------------
+# ① 同一時刻・同一条件の重複排除
+# -----------------------------------------------------
+worker_dedup = (
+    worker_base
+    .groupby(
+        ["日付", "受注番号", "受注品番", "ステーション", "作業者", "操作", "時刻"],
+        as_index=False
+    )
+    .agg(製造数=("製造数", "max"))
+)
+
+# -----------------------------------------------------
+# ② 開始系 / 終了系 に分離
+# -----------------------------------------------------
+start_df = worker_dedup[worker_dedup["操作"].isin(start_ops)]
+end_df   = worker_dedup[worker_dedup["操作"].isin(end_ops)]
+
+# -----------------------------------------------------
+# ③ 区間単位の開始・終了情報
+# -----------------------------------------------------
+start_agg = (
+    start_df
+    .groupby(["日付", "受注番号", "受注品番", "ステーション", "作業者"], as_index=False)
+    .agg(
+        開始時製造数=("製造数", "min"),
+        開始時刻=("時刻", "min")
+    )
+)
+
+end_agg = (
+    end_df
+    .groupby(["日付", "受注番号", "受注品番", "ステーション", "作業者"], as_index=False)
+    .agg(
+        終了時製造数=("製造数", "max"),
+        終了時刻=("時刻", "max")
+    )
+)
+
+# -----------------------------------------------------
+# ④ マージ → 実績算出
+# -----------------------------------------------------
+worker_diff = start_agg.merge(
+    end_agg,
+    on=["日付", "受注番号", "受注品番", "ステーション", "作業者"],
+    how="inner"
+)
+
+# 製造実績（差分）
+worker_diff["実績製造数"] = (
+    worker_diff["終了時製造数"] - worker_diff["開始時製造数"]
+)
+
+# 作業時間（分）
+worker_diff["作業時間_分"] = (
+    (worker_diff["終了時刻"] - worker_diff["開始時刻"])
+    .dt.total_seconds() / 60
+)
+
+# 異常系除外
+worker_diff = worker_diff[
+    (worker_diff["実績製造数"] > 0) &
+    (worker_diff["作業時間_分"] > 0)
+]
+
+# -----------------------------------------------------
+# ⑤ 日別 × 作業者 × 工程
+# -----------------------------------------------------
+worker_daily_station = (
+    worker_diff
+    .groupby(["日付", "作業者", "ステーション"], as_index=False)
+    .agg(
+        日別製造数=("実績製造数", "sum"),
+        作業時間_分=("作業時間_分", "sum")
+    )
+)
+
+st.subheader("作業者別 日別・工程別 製造実績 ＋ 作業時間")
+st.dataframe(
+    worker_daily_station.sort_values(["日付", "作業者", "ステーション"]),
+    use_container_width=True
+)
+
+if not worker_daily_station.empty:
+    st.download_button(
+        "📥 作業者別 × 工程別 実績をExcel出力",
+        data=to_excel(worker_daily_station, "作業者_工程別合計"),
+        file_name="作業者別_工程別_製造実績.xlsx"
+    )
+
+# -----------------------------------------------------
+# ⑥ 全工程合算（日別 × 作業者）
+# -----------------------------------------------------
+worker_daily_total = (
+    worker_daily_station
+    .groupby(["日付", "作業者"], as_index=False)
+    .agg(
+        日別製造数=("日別製造数", "sum"),
+        作業時間_分=("作業時間_分", "sum")
+    )
+)
+
+st.subheader("作業者別 日別 製造実績 合計（全工程合算）")
+st.dataframe(
+    worker_daily_total.sort_values(["日付", "作業者"]),
+    use_container_width=True
+)
+
+if not worker_daily_total.empty:
+    st.download_button(
+        "📥 作業者別 × 日別 実績をExcel出力",
+        data=to_excel(worker_daily_total, "作業者_日別合計"),
+        file_name="作業者別_日別_製造実績.xlsx"
+    )
+
+# =====================================================
+# ★ 作業者別 × 受注品番別 製造数・作業時間
+# =====================================================
+
+worker_partno = (
+    worker_diff
+    .groupby(
+        ["日付", "作業者", "受注品番"],
+        as_index=False
+    )
+    .agg(
+        製造数=("実績製造数", "sum"),
+        作業時間_分=("作業時間_分", "sum")
+    )
+)
+
+st.subheader("作業者別 × 受注品番別 製造実績・作業時間")
+st.dataframe(
+    worker_partno.sort_values(["日付", "作業者", "受注品番"]),
+    use_container_width=True
+)
+
+if not worker_partno.empty:
+    st.download_button(
+        "📥 作業者別 × 受注品番別 実績をExcel出力",
+        data=to_excel(worker_partno, "作業者_品番別"),
+        file_name="作業者別_受注品番別_製造実績.xlsx"
+    )
